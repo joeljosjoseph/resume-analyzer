@@ -486,11 +486,10 @@ function Results({ analysis, survey, setSurvey }) {
                 {["Yes", "Somewhat", "No"].map((option) => (
                   <button
                     key={option}
-                    className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                      survey.answer === option
+                    className={`rounded-full px-4 py-2 text-sm font-medium transition ${survey.answer === option
                         ? "bg-slate-950 text-white"
                         : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
-                    }`}
+                      }`}
                     type="button"
                     onClick={() => setSurvey((current) => ({ ...current, answer: option }))}
                   >
