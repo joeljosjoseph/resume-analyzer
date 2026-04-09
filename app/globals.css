@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --font-display: "Aptos Display", "Trebuchet MS", "Segoe UI", sans-serif;
+  --font-body: "Aptos", "Segoe UI", sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", monospace;
+  --paper: #f7f4ec;
+  --ink: #0d1726;
+  --sand: #d7c8a8;
+  --coral: #f58c6c;
+  --teal: #2b8c82;
+  --gold: #d3a43c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  font-family: var(--font-body);
+  background:
+    radial-gradient(circle at top left, rgba(245, 140, 108, 0.22), transparent 28%),
+    radial-gradient(circle at top right, rgba(43, 140, 130, 0.18), transparent 24%),
+    linear-gradient(180deg, #fbf8f2 0%, #f4efe5 40%, #eef5f3 100%);
+  color: var(--ink);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(245, 140, 108, 0.24);
+}
