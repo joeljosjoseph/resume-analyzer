@@ -1,13 +1,107 @@
 "use client";
 
-import { useState } from "react";
-import { analyzeResume } from "@/lib/analyzer.mjs";
+import { useEffect, useState } from "react";
 import { parseResumeFile } from "@/lib/resume-parsers.mjs";
 
 const EMPTY_SURVEY = {
   answer: "",
   note: "",
 };
+const STORAGE_KEY = "grounded-resume-analyzer-session";
+
+function createSessionSnapshot({
+  resumeFile,
+  jobDescription,
+  targetRole,
+  seniority,
+  extractedText,
+  parseIssues,
+  parseFormat,
+  status,
+  analysis,
+  survey,
+}) {
+  return {
+    savedAt: new Date().toISOString(),
+    resumeFileName: resumeFile?.name ?? "",
+    jobDescription,
+    targetRole,
+    seniority,
+    extractedText,
+    parseIssues,
+    parseFormat,
+    status,
+    analysis,
+    survey,
+  };
+}
+
+function downloadJsonFile(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+function normalizeLegacyList(items, fields) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      if (typeof item === "string") {
+        return item;
+      }
+
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+
+      return fields
+        .map((field) => item[field])
+        .filter((value) => typeof value === "string" && value.trim())
+        .join(" ")
+        .trim();
+    })
+    .filter(Boolean);
+}
+
+function normalizeSavedAnalysis(analysis) {
+  if (!analysis || typeof analysis !== "object") {
+    return analysis;
+  }
+
+  if ("fitAssessment" in analysis || "improvements" in analysis || "caveats" in analysis) {
+    return {
+      ...analysis,
+      strengths: normalizeLegacyList(analysis.strengths, ["jobRequirement", "explanation"]),
+      weaknesses: normalizeLegacyList(analysis.weaknesses, ["jobRequirement", "explanation"]),
+      improvements: normalizeLegacyList(analysis.improvements, ["reason", "revisedExample", "jobRequirement"]),
+      caveats: normalizeLegacyList(analysis.caveats, ["section", "importance"]),
+    };
+  }
+
+  return {
+    summary: analysis.scoreExplanation || "Previously saved analysis loaded from an older app version.",
+    fitAssessment:
+      analysis.score !== null && analysis.score !== undefined
+        ? `Legacy match score: ${analysis.score}. ${analysis.scoreBand || ""}`.trim()
+        : analysis.scoreBand || "Legacy analysis loaded from a previous version.",
+    strengths: normalizeLegacyList(analysis.strengths, ["jobRequirement", "explanation"]),
+    weaknesses: normalizeLegacyList(analysis.gaps, ["jobRequirement", "explanation", "label"]),
+    improvements: normalizeLegacyList(analysis.rewriteSuggestions, ["reason", "revisedExample", "jobRequirement"]),
+    caveats: normalizeLegacyList(analysis.missingSections, ["section", "importance"]).concat(
+      normalizeLegacyList(analysis.parsingIssues, []),
+    ),
+    model: "legacy-saved-analysis",
+  };
+}
 
 export default function Home() {
   const [resumeFile, setResumeFile] = useState(null);
@@ -21,6 +115,67 @@ export default function Home() {
   const [errorMessage, setErrorMessage] = useState("");
   const [analysis, setAnalysis] = useState(null);
   const [survey, setSurvey] = useState(EMPTY_SURVEY);
+  const [hasLoadedDraft, setHasLoadedDraft] = useState(false);
+
+  useEffect(() => {
+    const savedSession = window.localStorage.getItem(STORAGE_KEY);
+
+    if (!savedSession) {
+      setHasLoadedDraft(true);
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(savedSession);
+
+      setJobDescription(parsed.jobDescription ?? "");
+      setTargetRole(parsed.targetRole ?? "");
+      setSeniority(parsed.seniority ?? "");
+      setExtractedText(parsed.extractedText ?? "");
+      setParseIssues(Array.isArray(parsed.parseIssues) ? parsed.parseIssues : []);
+      setParseFormat(parsed.parseFormat ?? "");
+      setAnalysis(normalizeSavedAnalysis(parsed.analysis ?? null));
+      setSurvey(parsed.survey ?? EMPTY_SURVEY);
+      setStatus(parsed.status ?? "idle");
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } finally {
+      setHasLoadedDraft(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasLoadedDraft) {
+      return;
+    }
+
+    const snapshot = createSessionSnapshot({
+      resumeFile,
+      jobDescription,
+      targetRole,
+      seniority,
+      extractedText,
+      parseIssues,
+      parseFormat,
+      status,
+      analysis,
+      survey,
+    });
+
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+  }, [
+    resumeFile,
+    jobDescription,
+    targetRole,
+    seniority,
+    extractedText,
+    parseIssues,
+    parseFormat,
+    status,
+    analysis,
+    survey,
+    hasLoadedDraft,
+  ]);
 
   async function handleExtract(event) {
     event.preventDefault();
@@ -56,21 +211,80 @@ export default function Home() {
     }
   }
 
-  function handleAnalyze() {
+  async function handleAnalyze() {
     setErrorMessage("");
+    setStatus("analyzing");
 
-    const nextAnalysis = analyzeResume({
-      resumeText: extractedText,
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          resumeText: extractedText,
+          jobDescription,
+          targetRole,
+          seniority,
+          parsingIssues: parseIssues,
+        }),
+      });
+
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "The LLM analysis could not be completed.");
+      }
+
+      setAnalysis(payload.analysis);
+      setStatus("done");
+      setSurvey(EMPTY_SURVEY);
+    } catch (error) {
+      setStatus("ready");
+      setAnalysis(null);
+      setErrorMessage(error.message || "The LLM analysis could not be completed.");
+    }
+  }
+
+  function handleDownloadSession() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const snapshot = createSessionSnapshot({
+      resumeFile,
       jobDescription,
       targetRole,
       seniority,
-      parsingIssues: parseIssues,
+      extractedText,
+      parseIssues,
+      parseFormat,
+      status,
+      analysis,
+      survey,
     });
 
-    setAnalysis(nextAnalysis);
-    setStatus(nextAnalysis.refusal ? "ready" : "done");
+    downloadJsonFile(`resume-analysis-${timestamp}.json`, snapshot);
+  }
+
+  function handleClearSavedData() {
+    window.localStorage.removeItem(STORAGE_KEY);
+    setResumeFile(null);
+    setJobDescription("");
+    setTargetRole("");
+    setSeniority("");
+    setExtractedText("");
+    setParseIssues([]);
+    setParseFormat("");
+    setStatus("idle");
+    setErrorMessage("");
+    setAnalysis(null);
     setSurvey(EMPTY_SURVEY);
   }
+
+  const hasSessionData =
+    Boolean(jobDescription.trim()) ||
+    Boolean(targetRole.trim()) ||
+    Boolean(seniority.trim()) ||
+    Boolean(extractedText.trim()) ||
+    Boolean(analysis);
 
   return (
     <main className="min-h-screen px-4 py-6 text-slate-950 sm:px-6 lg:px-8">
@@ -86,20 +300,41 @@ export default function Home() {
             <div className="space-y-3">
               <h1
                 className="max-w-3xl text-4xl font-semibold tracking-[-0.05em] text-slate-950 sm:text-5xl lg:text-6xl"
-                style={{ fontFamily: "var(--font-display)" }}
+                style={{ fontFamily: "var(--font-display)" }} role="heading"
               >
                 Upload your resume, paste the role, and get honest feedback you can actually use.
               </h1>
               <p className="max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
-                This first version stays grounded on the confirmed resume text and the actual job description. It
-                highlights likely gaps, what already reads well, and where stronger wording would help.
+                This version sends the confirmed resume text and job description to an LLM on the server, then returns
+                a structured review with strengths, weaknesses, and concrete improvements.
               </p>
             </div>
             <div className="grid gap-3 sm:grid-cols-3">
               <InfoTile title="Input" body="PDF or DOCX plus a pasted job description." />
-              <InfoTile title="Guardrail" body="No fabricated experience, metrics, or skills." />
-              <InfoTile title="Output" body="Match score or low-confidence fallback, gaps, and rewrites." />
+              <InfoTile title="Guardrail" body="The prompt tells the model not to invent experience, metrics, or skills." />
+              <InfoTile title="Output" body="Summary, fit assessment, strengths, weaknesses, and improvements." />
             </div>
+            <div className="flex flex-wrap gap-3">
+              <button
+                className="inline-flex items-center justify-center rounded-full border border-slate-300 bg-white px-5 py-3 text-sm font-medium text-slate-800 transition hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                type="button"
+                onClick={handleDownloadSession}
+                disabled={!hasSessionData}
+              >
+                Download Session File
+              </button>
+              <button
+                className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-transparent px-5 py-3 text-sm font-medium text-slate-600 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+                type="button"
+                onClick={handleClearSavedData}
+                disabled={!hasSessionData}
+              >
+                Clear Saved Draft
+              </button>
+            </div>
+            <p className="text-sm leading-6 text-slate-500">
+              Your draft now auto-saves in this browser, and you can export the current session as a JSON file anytime.
+            </p>
           </div>
 
           <div className="rounded-[1.75rem] border border-slate-900/10 bg-slate-950 px-5 py-5 text-white shadow-[0_18px_50px_rgba(13,23,38,0.28)]">
@@ -113,17 +348,17 @@ export default function Home() {
               className="mt-3 text-2xl font-medium leading-tight"
               style={{ fontFamily: "var(--font-display)" }}
             >
-              Structured, evidence-based review instead of generic chatbot advice.
+              Server-side LLM review without exposing your API key in the browser.
             </h2>
             <div className="mt-5 grid gap-3 text-sm leading-6 text-slate-300">
               <p className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                Each gap is tied to a job requirement and the resume section that was reviewed.
+                Resume text stays editable before analysis, so you can correct bad extraction first.
               </p>
               <p className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                If extraction or input quality is weak, the app drops confidence instead of bluffing.
+                The OpenAI request runs from a Next.js route handler, not from the client.
               </p>
               <p className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                Suggestions only tell the user how to clarify what is already there.
+                The model is instructed to stay grounded in the provided resume and job description.
               </p>
             </div>
           </div>
@@ -211,7 +446,7 @@ export default function Home() {
                   {status === "extracting" ? "Extracting..." : "Extract Resume Text"}
                 </button>
                 <p className="self-center text-sm text-slate-500">
-                  The analyzer does not run until the extracted text is visible and editable below.
+                  The LLM does not run until the extracted text is visible and editable below.
                 </p>
               </div>
             </form>
@@ -259,7 +494,7 @@ export default function Home() {
                 </div>
               ) : (
                 <div className="rounded-[1.15rem] border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-                  The extracted text is ready for confirmation. Edit anything that looks incomplete before analyzing.
+                  The extracted text is ready for confirmation. Edit anything that looks incomplete before sending it to the model.
                 </div>
               )}
 
@@ -267,9 +502,9 @@ export default function Home() {
                 className="inline-flex items-center justify-center rounded-full bg-[var(--coral)] px-5 py-3 font-medium text-slate-950 transition hover:bg-[#f7a385] focus:outline-none focus:ring-2 focus:ring-[var(--sand)] disabled:cursor-not-allowed disabled:opacity-60"
                 type="button"
                 onClick={handleAnalyze}
-                disabled={!extractedText.trim() || !jobDescription.trim()}
+                disabled={!extractedText.trim() || !jobDescription.trim() || status === "analyzing"}
               >
-                Run Grounded Analysis
+                {status === "analyzing" ? "Analyzing..." : "Run LLM Analysis"}
               </button>
             </div>
           </div>
@@ -281,31 +516,11 @@ export default function Home() {
   );
 }
 
-function Results({ analysis, survey, setSurvey }) {
+const Results = ({ analysis, survey, setSurvey }) => {
   if (!analysis) {
     return (
       <section className="rounded-[1.75rem] border border-dashed border-slate-300 bg-white/60 px-6 py-10 text-center text-slate-500">
-        Extract the resume text, confirm it, and the grounded analysis will appear here.
-      </section>
-    );
-  }
-
-  if (analysis.refusal) {
-    return (
-      <section className="rounded-[1.75rem] border border-rose-200 bg-rose-50 px-6 py-6 text-rose-800">
-        <p
-          className="text-xs uppercase tracking-[0.22em] text-rose-500"
-          style={{ fontFamily: "var(--font-mono)" }}
-        >
-          Refusal
-        </p>
-        <h2
-          className="mt-2 text-2xl font-medium text-rose-950"
-          style={{ fontFamily: "var(--font-display)" }}
-        >
-          {analysis.refusal.title}
-        </h2>
-        <p className="mt-3 max-w-3xl text-base leading-7">{analysis.refusal.message}</p>
+        Extract the resume text, confirm it, and the LLM analysis will appear here.
       </section>
     );
   }
@@ -318,32 +533,16 @@ function Results({ analysis, survey, setSurvey }) {
             className="text-xs uppercase tracking-[0.24em] text-[var(--sand)]"
             style={{ fontFamily: "var(--font-mono)" }}
           >
-            Alignment
+            Summary
           </p>
-          <div className="mt-4 flex items-end gap-4">
-            <div>
-              <p
-                className="text-5xl font-semibold tracking-[-0.05em]"
-                style={{ fontFamily: "var(--font-display)" }}
-              >
-                {analysis.score ?? analysis.scoreBand}
-              </p>
-              <p className="mt-2 text-sm uppercase tracking-[0.18em] text-slate-300">
-                {analysis.score === null ? "confidence fallback" : "match score"}
-              </p>
-            </div>
-          </div>
-          <p className="mt-5 text-sm leading-6 text-slate-300">{analysis.scoreExplanation}</p>
+          <p className="mt-4 text-base leading-7 text-slate-200">{analysis.summary}</p>
 
           <div className="mt-5 rounded-[1.3rem] border border-white/10 bg-white/5 p-4">
-            <p className="text-sm font-medium text-white">Confidence: {analysis.confidence.level}</p>
-            <ul className="mt-3 space-y-2 text-sm leading-6 text-slate-300">
-              {analysis.confidence.reasons.length > 0 ? (
-                analysis.confidence.reasons.map((reason) => <li key={reason}>- {reason}</li>)
-              ) : (
-                <li>- Inputs look detailed enough for a directional read.</li>
-              )}
-            </ul>
+            <p className="text-sm font-medium text-white">Fit assessment</p>
+            <p className="mt-3 text-sm leading-6 text-slate-300">{analysis.fitAssessment}</p>
+            <p className="mt-4 text-xs uppercase tracking-[0.18em] text-slate-400">
+              Model: {analysis.model || "gpt-4o-mini"}
+            </p>
           </div>
         </div>
 
@@ -352,30 +551,29 @@ function Results({ analysis, survey, setSurvey }) {
             className="text-xs uppercase tracking-[0.22em] text-slate-400"
             style={{ fontFamily: "var(--font-mono)" }}
           >
-            What To Fix
+            Strengths
           </p>
           <h2
             className="mt-2 text-3xl font-medium text-slate-950"
             style={{ fontFamily: "var(--font-display)" }}
           >
-            Top 5 gaps
+            What is already working
           </h2>
           <div className="mt-5 space-y-3">
-            {analysis.gaps.map((gap) => (
-              <article
-                key={`${gap.jobRequirement}-${gap.section}`}
-                className="rounded-[1.3rem] border border-slate-200 bg-slate-50 px-4 py-4"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <span className="rounded-full bg-slate-950 px-3 py-1 text-xs uppercase tracking-[0.16em] text-white">
-                    {gap.label}
-                  </span>
-                  <span className="text-sm text-slate-500">Section reviewed: {gap.section}</span>
-                </div>
-                <p className="mt-3 text-base font-medium leading-7 text-slate-900">{gap.jobRequirement}</p>
-                <p className="mt-2 text-sm leading-6 text-slate-600">{gap.explanation}</p>
-              </article>
-            ))}
+            {analysis.strengths?.length > 0 ? (
+              analysis.strengths.map((strength) => (
+                <article
+                  key={strength}
+                  className="rounded-[1.3rem] border border-emerald-200 bg-emerald-50 px-4 py-4"
+                >
+                  <p className="text-sm leading-6 text-emerald-900">{strength}</p>
+                </article>
+              ))
+            ) : (
+              <div className="rounded-[1.3rem] border border-slate-200 bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-600">
+                No clear strengths were returned for this comparison.
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -386,35 +584,27 @@ function Results({ analysis, survey, setSurvey }) {
             className="text-xs uppercase tracking-[0.22em] text-slate-400"
             style={{ fontFamily: "var(--font-mono)" }}
           >
-            Rewrite Cues
+            Weaknesses
           </p>
           <h2
             className="mt-2 text-3xl font-medium text-slate-950"
             style={{ fontFamily: "var(--font-display)" }}
           >
-            3 grounded rewrite suggestions
+            What could hold this resume back
           </h2>
           <div className="mt-5 space-y-3">
-            {analysis.rewriteSuggestions.length > 0 ? (
-              analysis.rewriteSuggestions.map((suggestion) => (
+            {analysis.weaknesses?.length > 0 ? (
+              analysis.weaknesses.map((weakness) => (
                 <article
-                  key={`${suggestion.targetSection}-${suggestion.jobRequirement}`}
+                  key={weakness}
                   className="rounded-[1.3rem] border border-[var(--sand)]/70 bg-[#fff8ed] px-4 py-4"
                 >
-                  <p className="text-sm uppercase tracking-[0.16em] text-slate-500">{suggestion.targetSection}</p>
-                  <p className="mt-2 text-base font-medium leading-7 text-slate-900">{suggestion.reason}</p>
-                  <p className="mt-2 text-sm leading-6 text-slate-600">
-                    Maps to: <span className="font-medium text-slate-800">{suggestion.jobRequirement}</span>
-                  </p>
-                  <p className="mt-3 rounded-[1rem] bg-white px-3 py-3 text-sm leading-6 text-slate-700">
-                    {suggestion.revisedExample}
-                  </p>
+                  <p className="text-sm leading-6 text-slate-700">{weakness}</p>
                 </article>
               ))
             ) : (
               <div className="rounded-[1.3rem] border border-slate-200 bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-600">
-                The resume has very few partially matched gaps to rewrite. That usually means the biggest issues are
-                truly missing evidence, not wording.
+                No specific weaknesses were returned for this comparison.
               </div>
             )}
           </div>
@@ -426,29 +616,27 @@ function Results({ analysis, survey, setSurvey }) {
               className="text-xs uppercase tracking-[0.22em] text-slate-400"
               style={{ fontFamily: "var(--font-mono)" }}
             >
-              Already Working
+              Improvements
             </p>
             <h2
               className="mt-2 text-3xl font-medium text-slate-950"
               style={{ fontFamily: "var(--font-display)" }}
             >
-              Stronger signals
+              How to tighten the resume
             </h2>
             <div className="mt-5 space-y-3">
-              {analysis.strengths.length > 0 ? (
-                analysis.strengths.map((strength) => (
+              {analysis.improvements?.length > 0 ? (
+                analysis.improvements.map((improvement) => (
                   <article
-                    key={strength.jobRequirement}
-                    className="rounded-[1.3rem] border border-emerald-200 bg-emerald-50 px-4 py-4"
+                    key={improvement}
+                    className="rounded-[1.3rem] border border-sky-200 bg-sky-50 px-4 py-4"
                   >
-                    <p className="text-base font-medium leading-7 text-emerald-950">{strength.jobRequirement}</p>
-                    <p className="mt-2 text-sm leading-6 text-emerald-800">{strength.explanation}</p>
+                    <p className="text-sm leading-6 text-sky-900">{improvement}</p>
                   </article>
                 ))
               ) : (
                 <div className="rounded-[1.3rem] border border-slate-200 bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-600">
-                  No strong matches were found yet. That usually means the resume needs sharper alignment or the role is
-                  materially different from the candidate background.
+                  No improvement suggestions were returned for this comparison.
                 </div>
               )}
             </div>
@@ -459,21 +647,21 @@ function Results({ analysis, survey, setSurvey }) {
               className="text-xs uppercase tracking-[0.22em] text-slate-400"
               style={{ fontFamily: "var(--font-mono)" }}
             >
-              Missing Sections
+              Caveats
             </p>
             <div className="mt-4 space-y-3">
-              {analysis.missingSections.length > 0 ? (
-                analysis.missingSections.map((item) => (
+              {analysis.caveats?.length > 0 ? (
+                analysis.caveats.map((item) => (
                   <div
-                    key={item.section}
+                    key={item}
                     className="rounded-[1.15rem] border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600"
                   >
-                    <span className="font-medium text-slate-900">{item.section}</span>: {item.importance}
+                    {item}
                   </div>
                 ))
               ) : (
                 <div className="rounded-[1.15rem] border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-6 text-emerald-800">
-                  The resume includes the standard core sections this analyzer expects.
+                  No extra caveats were returned by the model.
                 </div>
               )}
             </div>
@@ -487,8 +675,8 @@ function Results({ analysis, survey, setSurvey }) {
                   <button
                     key={option}
                     className={`rounded-full px-4 py-2 text-sm font-medium transition ${survey.answer === option
-                        ? "bg-slate-950 text-white"
-                        : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
+                      ? "bg-slate-950 text-white"
+                      : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
                       }`}
                     type="button"
                     onClick={() => setSurvey((current) => ({ ...current, answer: option }))}
@@ -529,6 +717,7 @@ function StatusBadge({ status }) {
   const copy = {
     idle: "Waiting",
     extracting: "Parsing",
+    analyzing: "Analyzing",
     ready: "Ready",
     done: "Analyzed",
   };
